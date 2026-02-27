@@ -1,0 +1,6 @@
+# Compiled binary
+go-backend
+
+# Data persistence file
+data.json
+data.json.tmp

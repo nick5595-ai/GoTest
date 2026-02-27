@@ -1,66 +1,110 @@
-# Go Backend Client
+# Go Backend
 
-This Go application consumes the Node.js backend API and demonstrates various API interactions.
+HTTP server providing the data layer for the three-tier architecture (React → Node.js → **Go**).
 
 ## Setup
 
-1. Make sure Go is installed (version 1.21 or higher)
-
-2. Install dependencies:
+1. Go 1.21+ required
+2. Install dependencies and run:
 ```bash
 go mod tidy
+go run .
 ```
-
-3. Run the application:
-```bash
-go run main.go
-```
-
 Or build and run:
 ```bash
 go build -o go-backend
 ./go-backend
 ```
 
+The server starts on `http://localhost:8080` by default.
+
 ## Configuration
 
-The Go backend connects to the Node.js backend at `http://localhost:3000` by default.
+| Environment Variable | Default      | Description                     |
+|---------------------|--------------|---------------------------------|
+| `PORT`              | `8080`       | HTTP server port                |
+| `DATA_FILE`         | `data.json`  | Path to persistence JSON file   |
 
-You can override this by setting the `NODE_BACKEND_URL` environment variable:
-```bash
-NODE_BACKEND_URL=http://localhost:3000 go run main.go
+## API Endpoints
+
+### Health
+
+| Method | Path      | Description                                      |
+|--------|-----------|--------------------------------------------------|
+| GET    | `/health` | Health check with version, uptime, and data store status |
+
+### Users
+
+| Method | Path             | Description          |
+|--------|------------------|----------------------|
+| GET    | `/api/users`     | List all users       |
+| GET    | `/api/users/:id` | Get user by ID       |
+| POST   | `/api/users`     | Create a new user    |
+
+**POST /api/users** — JSON body:
+```json
+{"name": "Alice", "email": "alice@example.com", "role": "developer"}
 ```
+- All fields required, email format validated
+- Returns `201` with created user, or `400` on validation error
+
+### Tasks
+
+| Method    | Path             | Description                             |
+|-----------|------------------|-----------------------------------------|
+| GET       | `/api/tasks`     | List tasks (supports `?status=` and `?userId=` query params) |
+| GET       | `/api/tasks/:id` | Get task by ID                          |
+| POST      | `/api/tasks`     | Create a new task                       |
+| PUT/PATCH | `/api/tasks/:id` | Update an existing task (partial update)|
+
+**POST /api/tasks** — JSON body:
+```json
+{"title": "Fix bug", "status": "pending", "userId": 1}
+```
+- `status` must be one of: `pending`, `in-progress`, `completed`
+- `userId` must reference an existing user
+- Returns `201` with created task, or `400` on validation error
+
+**PUT /api/tasks/:id** — JSON body (all fields optional):
+```json
+{"title": "Updated title", "status": "completed", "userId": 2}
+```
+- Only provided fields are updated (partial update)
+- Returns `200` with updated task, `404` if not found, or `400` on validation error
+
+### Statistics
+
+| Method | Path         | Description                        |
+|--------|--------------|------------------------------------|
+| GET    | `/api/stats` | Aggregate counts for users & tasks |
 
 ## Features
 
-The Go application demonstrates:
-- HTTP client implementation with timeout
-- JSON request/response handling
-- Error handling
-- API endpoint consumption
-- Structured data types
-- Health check verification
-
-## What It Does
-
-The application:
-1. Checks the health of the Node.js backend
-2. Fetches all users and displays them
-3. Fetches a specific user by ID
-4. Fetches all tasks
-5. Fetches tasks filtered by status
-6. Retrieves and displays statistics
+- **Request Logging**: All requests logged with method, path, status code, and duration
+- **CORS**: Full CORS support including preflight OPTIONS handling
+- **File Persistence**: Data saved to `data.json` on every mutation; loaded on startup. Atomic writes via temp file + rename. Corrupted files handled gracefully.
+- **Thread Safety**: All data access protected by `sync.RWMutex`
+- **Consistent Error Responses**: All errors returned as `{"error": "message"}` JSON
+- **Enhanced Health Check**: Includes version, uptime, and data store status
 
 ## Testing
 
-Make sure the Node.js backend is running before executing the Go application.
-
 ```bash
-# Terminal 1: Start Node.js backend
-cd node-backend
-npm start
-
-# Terminal 2: Run Go application
-cd go-backend
-go run main.go
+go test ./...            # Run all tests
+go test -v ./...         # Verbose output
+go test -cover ./...     # With coverage report
 ```
+
+Test files:
+- `data_test.go` — Unit tests for DataStore operations (CRUD, filtering, concurrency)
+- `server_test.go` — Integration tests for all HTTP endpoints
+- `persistence_test.go` — File persistence tests (save/load, corruption, concurrency)
+
+Current coverage: **85%+** across 60 tests.
+
+## Design Decisions
+
+- **Standard library only**: No external dependencies — uses `net/http`, `encoding/json`, `sync`, `log`
+- **Async persistence**: `onChanged` callback fires saves in a goroutine to avoid blocking request handlers
+- **Atomic file writes**: Write to `.tmp` then rename to prevent corruption on crash
+- **Pointer fields for partial updates**: `TaskUpdateRequest` uses `*string`/`*int` to distinguish "not provided" from zero values

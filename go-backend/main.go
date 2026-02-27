@@ -1,11 +1,13 @@
 package main
 
 import (
+	"log"
 	"os"
 )
 
 const (
 	defaultPort = "8080"
+	appVersion  = "1.0.0"
 )
 
 type User struct {
@@ -45,8 +47,17 @@ type StatsResponse struct {
 }
 
 type HealthResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
+	Status    string              `json:"status"`
+	Message   string              `json:"message"`
+	Version   string              `json:"version,omitempty"`
+	Uptime    string              `json:"uptime,omitempty"`
+	DataStore *DataStoreHealth    `json:"dataStore,omitempty"`
+}
+
+type DataStoreHealth struct {
+	Status     string `json:"status"`
+	UserCount  int    `json:"userCount"`
+	TaskCount  int    `json:"taskCount"`
 }
 
 func main() {
@@ -54,6 +65,21 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = defaultPort
+	}
+
+	// Set up file-based persistence
+	dataFile := os.Getenv("DATA_FILE")
+	if dataFile == "" {
+		dataFile = defaultDataFile
+	}
+	persistence := NewFilePersistence(dataFile)
+	if err := persistence.Load(store); err != nil {
+		log.Printf("Warning: could not load data file: %v", err)
+	}
+	store.onChanged = func() {
+		if err := persistence.Save(store); err != nil {
+			log.Printf("Error saving data: %v", err)
+		}
 	}
 
 	server := NewServer(store)
