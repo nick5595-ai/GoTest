@@ -66,14 +66,33 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 type Server struct {
-	dataStore *DataStore
-	startTime time.Time
+	dataStore   Store
+	startTime   time.Time
+	cache       *Cache
+	metrics     *Metrics
+	rateLimiter *RateLimiter
+	authCfg     AuthConfig
+	validCfg    RequestValidationConfig
 }
 
-func NewServer(dataStore *DataStore) *Server {
+// ServerConfig holds all optional configuration for the server.
+type ServerConfig struct {
+	Cache       *Cache
+	Metrics     *Metrics
+	RateLimiter *RateLimiter
+	AuthCfg     AuthConfig
+	ValidCfg    RequestValidationConfig
+}
+
+func NewServer(dataStore Store, cfg ServerConfig) *Server {
 	return &Server{
-		dataStore: dataStore,
-		startTime: time.Now(),
+		dataStore:   dataStore,
+		startTime:   time.Now(),
+		cache:       cfg.Cache,
+		metrics:     cfg.Metrics,
+		rateLimiter: cfg.RateLimiter,
+		authCfg:     cfg.AuthCfg,
+		validCfg:    cfg.ValidCfg,
 	}
 }
 
@@ -85,6 +104,8 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("/api/tasks", s.handleTasks)
 	mux.HandleFunc("/api/tasks/", s.handleTaskByID)
 	mux.HandleFunc("/api/stats", s.handleStats)
+	mux.HandleFunc("/api/cache/stats", s.handleCacheStats)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	return mux
 }
 
@@ -125,10 +146,19 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
+		if s.cache != nil {
+			if cached, ok := s.cache.Get("users"); ok {
+				writeJSON(w, http.StatusOK, cached)
+				return
+			}
+		}
 		users := s.dataStore.GetUsers()
 		response := UsersResponse{
 			Users: users,
 			Count: len(users),
+		}
+		if s.cache != nil {
+			s.cache.Set("users", response)
 		}
 		writeJSON(w, http.StatusOK, response)
 
@@ -152,6 +182,9 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Printf("Created user: id=%d name=%s", user.ID, user.Name)
+		if s.cache != nil {
+			s.cache.Invalidate()
+		}
 		writeJSON(w, http.StatusCreated, user)
 
 	default:
@@ -198,11 +231,22 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		status := r.URL.Query().Get("status")
 		userID := r.URL.Query().Get("userId")
+		cacheKey := "tasks:" + status + ":" + userID
+
+		if s.cache != nil {
+			if cached, ok := s.cache.Get(cacheKey); ok {
+				writeJSON(w, http.StatusOK, cached)
+				return
+			}
+		}
 
 		tasks := s.dataStore.GetTasks(status, userID)
 		response := TasksResponse{
 			Tasks: tasks,
 			Count: len(tasks),
+		}
+		if s.cache != nil {
+			s.cache.Set(cacheKey, response)
 		}
 		writeJSON(w, http.StatusOK, response)
 
@@ -226,6 +270,9 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Printf("Created task: id=%d title=%s", task.ID, task.Title)
+		if s.cache != nil {
+			s.cache.Invalidate()
+		}
 		writeJSON(w, http.StatusCreated, task)
 
 	default:
@@ -277,6 +324,9 @@ func (s *Server) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Printf("Updated task: id=%d", updated.ID)
+		if s.cache != nil {
+			s.cache.Invalidate()
+		}
 		writeJSON(w, http.StatusOK, updated)
 
 	default:
@@ -299,9 +349,77 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
+func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if s.cache == nil {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "disabled"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.cache.Stats())
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "disabled"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.metrics.Snapshot())
+}
+
+// metricsMiddleware records request metrics when a Metrics tracker is available.
+func metricsMiddleware(m *Metrics) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if m == nil {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			wrapped := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+			next.ServeHTTP(wrapped, r)
+			m.Record(r.Method, r.URL.Path, wrapped.statusCode, time.Since(start))
+		})
+	}
+}
+
 func (s *Server) Start(port string) {
 	mux := s.setupRoutes()
-	handler := loggingMiddleware(mux)
+
+	// Build middleware chain (outermost first)
+	var handler http.Handler = mux
+
+	// Metrics (innermost — records after all other middleware)
+	handler = metricsMiddleware(s.metrics)(handler)
+
+	// Logging
+	handler = loggingMiddleware(handler)
+
+	// Request validation
+	handler = requestValidationMiddleware(s.validCfg)(handler)
+
+	// Rate limiting
+	if s.rateLimiter != nil {
+		handler = s.rateLimiter.Middleware()(handler)
+	}
+
+	// Authentication (outermost)
+	handler = authMiddleware(s.authCfg)(handler)
 
 	if port == "" {
 		port = defaultPort

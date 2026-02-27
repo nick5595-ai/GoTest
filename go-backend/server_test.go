@@ -6,11 +6,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
-// newTestServer returns a Server backed by a fresh test DataStore.
+// newTestServer returns a Server backed by a fresh test DataStore (no cache/metrics/auth).
 func newTestServer() *Server {
-	return NewServer(newTestStore())
+	return NewServer(newTestStore(), ServerConfig{})
+}
+
+// newTestServerWithCache returns a Server with caching enabled.
+func newTestServerWithCache() *Server {
+	return NewServer(newTestStore(), ServerConfig{
+		Cache: NewCache(5 * time.Minute),
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -504,5 +512,237 @@ func TestServer_FullMux_Routing(t *testing.T) {
 		if w.Code != tc.status {
 			t.Errorf("%s %s: expected %d, got %d; body: %s", tc.method, tc.path, tc.status, w.Code, w.Body.String())
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cache Stats endpoint
+// ---------------------------------------------------------------------------
+
+func TestServer_handleCacheStats_Disabled(t *testing.T) {
+	s := newTestServer() // no cache
+	req := httptest.NewRequest(http.MethodGet, "/api/cache/stats", nil)
+	w := httptest.NewRecorder()
+	s.handleCacheStats(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["status"] != "disabled" {
+		t.Errorf("expected disabled, got %s", resp["status"])
+	}
+}
+
+func TestServer_handleCacheStats_Enabled(t *testing.T) {
+	s := newTestServerWithCache()
+	// Trigger a cache set via users GET
+	req := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	w := httptest.NewRecorder()
+	s.handleUsers(w, req)
+
+	// Now get cache stats
+	req = httptest.NewRequest(http.MethodGet, "/api/cache/stats", nil)
+	w = httptest.NewRecorder()
+	s.handleCacheStats(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp CacheStatsResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Entries < 1 {
+		t.Errorf("expected at least 1 cache entry, got %d", resp.Entries)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics endpoint
+// ---------------------------------------------------------------------------
+
+func TestServer_handleMetrics_Disabled(t *testing.T) {
+	s := newTestServer() // no metrics
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	s.handleMetrics(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["status"] != "disabled" {
+		t.Errorf("expected disabled, got %s", resp["status"])
+	}
+}
+
+func TestServer_handleMetrics_Enabled(t *testing.T) {
+	m := NewMetrics()
+	s := NewServer(newTestStore(), ServerConfig{Metrics: m})
+
+	// Record something via the metrics directly
+	m.Record("GET", "/test", 200, time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	s.handleMetrics(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp MetricsResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.TotalRequests != 1 {
+		t.Errorf("expected 1 total request, got %d", resp.TotalRequests)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cache integration: invalidation on mutations
+// ---------------------------------------------------------------------------
+
+func TestServer_CacheInvalidation_OnCreateUser(t *testing.T) {
+	s := newTestServerWithCache()
+
+	// GET users — populates cache
+	req := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	w := httptest.NewRecorder()
+	s.handleUsers(w, req)
+
+	// POST user — should invalidate cache
+	body := `{"name":"New","email":"new@test.com","role":"dev"}`
+	req = httptest.NewRequest(http.MethodPost, "/api/users", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	s.handleUsers(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", w.Code)
+	}
+
+	// GET users again — should get fresh data with 3 users
+	req = httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	w = httptest.NewRecorder()
+	s.handleUsers(w, req)
+
+	var resp UsersResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Count != 3 {
+		t.Errorf("expected 3 users after create+invalidation, got %d", resp.Count)
+	}
+}
+
+func TestServer_CacheInvalidation_OnCreateTask(t *testing.T) {
+	s := newTestServerWithCache()
+
+	// GET tasks — populates cache
+	req := httptest.NewRequest(http.MethodGet, "/api/tasks", nil)
+	w := httptest.NewRecorder()
+	s.handleTasks(w, req)
+
+	// POST task
+	body := `{"title":"New","status":"pending","userId":1}`
+	req = httptest.NewRequest(http.MethodPost, "/api/tasks", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	s.handleTasks(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", w.Code)
+	}
+
+	// GET tasks again
+	req = httptest.NewRequest(http.MethodGet, "/api/tasks", nil)
+	w = httptest.NewRecorder()
+	s.handleTasks(w, req)
+
+	var resp TasksResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Count != 4 {
+		t.Errorf("expected 4 tasks after create+invalidation, got %d", resp.Count)
+	}
+}
+
+func TestServer_CacheInvalidation_OnUpdateTask(t *testing.T) {
+	s := newTestServerWithCache()
+
+	// GET tasks — populates cache
+	req := httptest.NewRequest(http.MethodGet, "/api/tasks", nil)
+	w := httptest.NewRecorder()
+	s.handleTasks(w, req)
+
+	// PUT task
+	body := `{"status":"completed"}`
+	req = httptest.NewRequest(http.MethodPut, "/api/tasks/1", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	s.handleTaskByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// Cache should be cleared
+	stats := s.cache.Stats()
+	if stats.Entries != 0 {
+		t.Errorf("expected 0 cache entries after invalidation, got %d", stats.Entries)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Full middleware chain integration
+// ---------------------------------------------------------------------------
+
+func TestServer_FullMiddlewareChain(t *testing.T) {
+	m := NewMetrics()
+	rl := NewRateLimiter(RateLimiterConfig{Limit: 100, Window: time.Minute})
+	s := NewServer(newTestStore(), ServerConfig{
+		Cache:       NewCache(5 * time.Minute),
+		Metrics:     m,
+		RateLimiter: rl,
+		AuthCfg:     AuthConfig{APIKey: "test-key", ExemptPaths: []string{"/health", "/metrics"}},
+		ValidCfg:    RequestValidationConfig{MaxBodySize: 1 << 20},
+	})
+
+	mux := s.setupRoutes()
+	var handler http.Handler = mux
+	handler = metricsMiddleware(s.metrics)(handler)
+	handler = loggingMiddleware(handler)
+	handler = requestValidationMiddleware(s.validCfg)(handler)
+	handler = s.rateLimiter.Middleware()(handler)
+	handler = authMiddleware(s.authCfg)(handler)
+
+	// Health should be exempt from auth
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("health: expected 200, got %d; body: %s", w.Code, w.Body.String())
+	}
+
+	// API call without key should be 401
+	req = httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("no key: expected 401, got %d", w.Code)
+	}
+
+	// API call with valid key
+	req = httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	req.Header.Set("X-API-Key", "test-key")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("valid key: expected 200, got %d; body: %s", w.Code, w.Body.String())
+	}
+
+	// Check rate limit headers present
+	if w.Header().Get("X-RateLimit-Limit") == "" {
+		t.Error("expected X-RateLimit-Limit header")
+	}
+
+	// Metrics should have recorded requests that passed auth (health exempt + valid key)
+	snap := m.Snapshot()
+	if snap.TotalRequests < 2 {
+		t.Errorf("expected at least 2 recorded requests, got %d", snap.TotalRequests)
 	}
 }

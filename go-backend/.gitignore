@@ -4,3 +4,8 @@ go-backend
 # Data persistence file
 data.json
 data.json.tmp
+
+# SQLite database
+*.db
+*.db-wal
+*.db-shm
